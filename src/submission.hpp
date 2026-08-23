@@ -3,15 +3,14 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <immintrin.h>
 #include <new>
-#include <sys/mman.h>
-
-#include <cstddef>
 #include <thread>
-#include <xmmintrin.h>
+
+#include <immintrin.h>
+#include <sys/mman.h>
 
 class Grid;
 
@@ -24,7 +23,10 @@ public:
 	Proxy(Grid *g, size_t idx) : g(g), idx(idx) {}
 
 	operator double() const;
-	Proxy operator=(double);
+	Proxy &operator=(double);
+	Proxy &operator=(const Proxy &o) {
+		return *this = double(o);
+	}
 };
 
 // Starter Grid for the 2D heat-diffusion problem.
@@ -257,7 +259,7 @@ Proxy::operator double() const {
 	return g->fixed_[idx] * g->dequant_ + g->min_;
 }
 
-Proxy Proxy::operator=(double x) {
+Proxy &Proxy::operator=(double x) {
 	if (g->bad_ || g->num_steps_ != 0) {
 		g->fallback();
 		g->bad_ = false;

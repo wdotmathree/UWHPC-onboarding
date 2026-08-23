@@ -44,8 +44,6 @@ private:
 	mutable size_t max_steps_ = 0;
 	mutable size_t num_steps_ = 0;
 	mutable double min_ = +INFINITY;
-	mutable double max_ = -INFINITY;
-	mutable double quant_;
 	mutable double dequant_;
 	mutable bool bad_ = false;
 	mutable bool fixed_valid_ = false;
@@ -173,7 +171,7 @@ public:
 		__m128d hi = _mm256_extractf128_pd(max, 1);
 		lo = _mm_max_pd(lo, hi);
 		hi = _mm_unpackhi_pd(lo, lo);
-		max_ = _mm_cvtsd_f64(_mm_max_sd(lo, hi));
+		double max_ = _mm_cvtsd_f64(_mm_max_sd(lo, hi));
 		lo = _mm256_castpd256_pd128(min);
 		hi = _mm256_extractf128_pd(min, 1);
 		lo = _mm_min_pd(lo, hi);
@@ -194,7 +192,7 @@ public:
 			return;
 		}
 
-		quant_ = std::floor((double(0xfffffff8U) / 4) / range);
+		double quant_ = std::floor((double(0xfffffff8U) / 4) / range);
 		dequant_ = 1.0 / quant_;
 
 		const double ERR_GROWTH_RATE = 4e11; // Empirically found constant
@@ -246,8 +244,6 @@ public:
 		max_steps_ = o.max_steps_;
 		num_steps_ = o.num_steps_;
 		min_ = o.min_;
-		max_ = o.max_;
-		quant_ = o.quant_;
 		dequant_ = o.dequant_;
 		bad_ = o.bad_;
 		fixed_valid_ = o.fixed_valid_;
@@ -338,11 +334,6 @@ static void _apply_stencil_float(const Grid &old_grid, Grid &new_grid, size_t st
 		nrow[M - 1] = row[M - 1];
 		nrow[0] = row[0];
 	}
-
-	if (start < end) {
-		new_data[(end - 1) * M + M - 1] = old_data[(end - 1) * M + M - 1];
-		new_data[start * M] = old_data[start * M];
-	}
 }
 
 template <bool aligned>
@@ -411,11 +402,6 @@ static void _apply_stencil_fixed(const Grid &old_grid, Grid &new_grid, size_t st
 
 		nrow[M - 1] = row[M - 1];
 		nrow[0] = row[0];
-	}
-
-	if (start < end) {
-		new_data[(end - 1) * M + M - 1] = old_data[(end - 1) * M + M - 1];
-		new_data[start * M] = old_data[start * M];
 	}
 }
 

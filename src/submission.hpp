@@ -41,13 +41,13 @@ private:
 	double *data_;
 	uint32_t *fixed_;
 
-	size_t max_steps_ = 0;
-	size_t num_steps_ = 0;
-	double min_ = +INFINITY;
-	double max_ = -INFINITY;
-	double quant_;
-	double dequant_;
-	bool bad_ = false;
+	mutable size_t max_steps_ = 0;
+	mutable size_t num_steps_ = 0;
+	mutable double min_ = +INFINITY;
+	mutable double max_ = -INFINITY;
+	mutable double quant_;
+	mutable double dequant_;
+	mutable bool bad_ = false;
 
 	friend class Proxy;
 
@@ -93,7 +93,7 @@ public:
 	}
 	double operator()(size_t i, size_t j) const {
 		size_t idx = i * cols_ + j;
-		if (bad_ || num_steps_ >= max_steps_)
+		if (bad_ || max_steps_ == 0)
 			return data_[idx];
 
 		return fixed_[idx] * dequant_ + min_;
@@ -119,7 +119,7 @@ public:
 		return cols_;
 	}
 
-	void fallback() {
+	void fallback() const {
 		if (max_steps_ == 0) {
 			return;
 		}
@@ -143,7 +143,7 @@ public:
 		}
 	}
 
-	void promote() {
+	void promote() const {
 		const size_t stride = 256 / 8 / sizeof(double);
 		const size_t S = rows_ * cols_;
 		const size_t T = S % stride;
@@ -176,7 +176,7 @@ public:
 	}
 
 	// Returns true if the fixed point representation is valid
-	bool prerun() {
+	bool prerun() const {
 		if (__builtin_expect(bad_, false))
 			return false;
 
@@ -195,10 +195,20 @@ public:
 			return true;
 		}
 	}
+
+	void copy_metadata(const Grid &o) {
+		max_steps_ = o.max_steps_;
+		num_steps_ = o.num_steps_;
+		min_ = o.min_;
+		max_ = o.max_;
+		quant_ = o.quant_;
+		dequant_ = o.dequant_;
+		bad_ = o.bad_;
+	}
 };
 
 Proxy::operator double() const {
-	if (g->bad_ || g->num_steps_ >= g->max_steps_)
+	if (g->bad_ || g->max_steps_ == 0)
 		return g->data_[idx];
 
 	return g->fixed_[idx] * g->dequant_ + g->min_;
@@ -308,7 +318,7 @@ struct ThreadInfo {
 			const Grid *old_grid;
 			Grid *new_grid;
 			size_t start, end;
-			bool aligned;
+			bool fixed, aligned;
 		};
 		uint8_t pad[64];
 	};
@@ -342,15 +352,20 @@ static void worker(int idx) {
 static void apply_stencil(const Grid &old_grid, Grid &new_grid) {
 	const size_t N = old_grid.rows();
 	const size_t M = old_grid.cols();
-	const bool aligned = (M % (256 / 64)) == 0;
+
+	const bool fixed = old_grid.prerun();
+	const bool aligned = fixed ? (M % (256 / 32)) == 0 : (M % (256 / 64)) == 0;
 
 	if (N >= 8) {
 		size_t base = 1;
 		const size_t stride = (N - 2) / NTHREADS;
+		size_t extra = (N - 2) - stride * NTHREADS;
 
 		for (int i = 0; i < NTHREADS - 1; i++) {
-			tis[i] = {&old_grid, &new_grid, base, base + stride, aligned};
-			base += stride;
+			size_t size = stride + (i < extra);
+
+			tis[i] = {&old_grid, &new_grid, base, base + size, fixed, aligned};
+			base += size;
 		}
 
 		done.store(0, std::memory_order_relaxed);
@@ -360,17 +375,22 @@ static void apply_stencil(const Grid &old_grid, Grid &new_grid) {
 			_apply_stencil<true>(old_grid, new_grid, base, N - 1);
 		else
 			_apply_stencil<false>(old_grid, new_grid, base, N - 1);
-
-		std::memcpy(new_grid.get_float(N - 1, 0), old_grid.get_float(N - 1, 0), M * sizeof(double));
-		std::memcpy(new_grid.get_float(0, 0), old_grid.get_float(0, 0), M * sizeof(double));
-
-		while (done.load(std::memory_order_acquire) < NTHREADS - 1)
-			_mm_pause();
 	} else {
 		_apply_stencil<false>(old_grid, new_grid, 1, N - 1);
+	}
 
+	if (fixed) {
+		std::memcpy(new_grid.get_fixed(N - 1, 0), old_grid.get_fixed(N - 1, 0), M * sizeof(double));
+		std::memcpy(new_grid.get_fixed(0, 0), old_grid.get_fixed(0, 0), M * sizeof(double));
+	} else {
 		std::memcpy(new_grid.get_float(N - 1, 0), old_grid.get_float(N - 1, 0), M * sizeof(double));
 		std::memcpy(new_grid.get_float(0, 0), old_grid.get_float(0, 0), M * sizeof(double));
+	}
+	new_grid.copy_metadata(old_grid);
+
+	if (N >= 8) {
+		while (done.load(std::memory_order_acquire) < NTHREADS - 1)
+			_mm_pause();
 	}
 }
 

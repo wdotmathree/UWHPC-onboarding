@@ -156,7 +156,7 @@ public:
 		__m256d nan = _mm256_setzero_pd();
 		__m256d max = _mm256_set1_pd(-INFINITY);
 		__m256d min = _mm256_set1_pd(+INFINITY);
-		for (int i = 0; i < S - T; i += stride) {
+		for (size_t i = 0; i < S - T; i += stride) {
 			__m256d val = _mm256_load_pd(data_ + i);
 			nan = _mm256_or_pd(nan, _mm256_cmp_pd(val, val, _CMP_UNORD_Q));
 			max = _mm256_max_pd(max, val);
@@ -176,7 +176,7 @@ public:
 		lo = _mm_min_pd(lo, hi);
 		hi = _mm_unpackhi_pd(lo, lo);
 		min_ = _mm_cvtsd_f64(_mm_min_sd(lo, hi));
-		for (int i = S - T; i < S; i++) {
+		for (size_t i = S - T; i < S; i++) {
 			if (__builtin_expect(std::isnan(data_[i]), false)) {
 				bad_ = true;
 				return;
@@ -273,7 +273,6 @@ Proxy Proxy::operator=(double x) {
 
 template <bool aligned>
 static void _apply_stencil_float(const Grid &old_grid, Grid &new_grid, size_t start, size_t end) {
-	const size_t N = old_grid.rows();
 	const size_t M = old_grid.cols();
 
 	const double *__restrict__ old_data = old_grid.get_float(0, 0);
@@ -292,12 +291,12 @@ static void _apply_stencil_float(const Grid &old_grid, Grid &new_grid, size_t st
 	const __m256d two = _mm256_set1_pd(0.5);
 	const __m256d eight = _mm256_set1_pd(0.125);
 
-	for (int i = start; i < end; i++) {
+	for (size_t i = start; i < end; i++) {
 		const double *row = old_data + (size_t)i * M;
 		double *nrow = new_data + (size_t)i * M;
 
 		if constexpr (aligned) {
-			for (int j = 0; j < M; j += stride) {
+			for (size_t j = 0; j < M; j += stride) {
 				__m256d up = _mm256_load_pd(row + j - M);
 				__m256d down = _mm256_load_pd(row + j + M);
 				__m256d left = _mm256_loadu_pd(row + j - 1);
@@ -314,7 +313,7 @@ static void _apply_stencil_float(const Grid &old_grid, Grid &new_grid, size_t st
 			}
 		} else {
 			const size_t T = (M - 1) % stride;
-			for (int j = 1; j < M - T; j += stride) {
+			for (size_t j = 1; j < M - T; j += stride) {
 				__m256d up = _mm256_loadu_pd(row + j - M);
 				__m256d down = _mm256_loadu_pd(row + j + M);
 				__m256d left = _mm256_loadu_pd(row + j - 1);
@@ -329,7 +328,7 @@ static void _apply_stencil_float(const Grid &old_grid, Grid &new_grid, size_t st
 
 				_mm256_storeu_pd(nrow + j, cur);
 			}
-			for (int j = M - T; j < M; j++)
+			for (size_t j = M - T; j < M; j++)
 				nrow[j] = 0.5 * row[j] + 0.125 * (row[j - M] + row[j - 1] + row[j + M] + row[j + 1]);
 		}
 
@@ -345,7 +344,6 @@ static void _apply_stencil_float(const Grid &old_grid, Grid &new_grid, size_t st
 
 template <bool aligned>
 static void _apply_stencil_fixed(const Grid &old_grid, Grid &new_grid, size_t start, size_t end, bool odd) {
-	const size_t N = old_grid.rows();
 	const size_t M = old_grid.cols();
 
 	const uint32_t *__restrict__ old_data = old_grid.get_fixed(0, 0);
@@ -366,12 +364,12 @@ static void _apply_stencil_fixed(const Grid &old_grid, Grid &new_grid, size_t st
 	const __m256i inner_round = _mm256_set1_epi32(_inner_round);
 	const __m256i outer_round = _mm256_set1_epi32(_outer_round);
 
-	for (int i = start; i < end; i++) {
+	for (size_t i = start; i < end; i++) {
 		const uint32_t *row = old_data + (size_t)i * M;
 		uint32_t *nrow = new_data + (size_t)i * M;
 
 		if constexpr (aligned) {
-			for (int j = 0; j < M; j += stride) {
+			for (size_t j = 0; j < M; j += stride) {
 				__m256i up = _mm256_load_si256((__m256i *)(row + j - M));
 				__m256i down = _mm256_load_si256((__m256i *)(row + j + M));
 				__m256i left = _mm256_loadu_si256((__m256i *)(row + j - 1));
@@ -388,7 +386,7 @@ static void _apply_stencil_fixed(const Grid &old_grid, Grid &new_grid, size_t st
 			}
 		} else {
 			const size_t T = (M - 1) % stride;
-			for (int j = 1; j < M - T; j += stride) {
+			for (size_t j = 1; j < M - T; j += stride) {
 				__m256i up = _mm256_loadu_si256((__m256i *)(row + j - M));
 				__m256i down = _mm256_loadu_si256((__m256i *)(row + j + M));
 				__m256i left = _mm256_loadu_si256((__m256i *)(row + j - 1));
@@ -403,7 +401,7 @@ static void _apply_stencil_fixed(const Grid &old_grid, Grid &new_grid, size_t st
 				cur = _mm256_add_epi32(inner, around);
 				_mm256_storeu_si256((__m256i *)(nrow + j), cur);
 			}
-			for (int j = M - T; j < M; j++)
+			for (size_t j = M - T; j < M; j++)
 				nrow[j] = ((row[j] + _inner_round) >> 1) +
 						  ((row[j - M] + row[j - 1] + row[j + M] + row[j + 1] + _outer_round) >> 3);
 		}
@@ -475,7 +473,7 @@ static void apply_stencil(const Grid &old_grid, Grid &new_grid) {
 		const size_t stride = (N - 2) / NTHREADS;
 		size_t extra = (N - 2) - stride * NTHREADS;
 
-		for (int i = 0; i < NTHREADS - 1; i++) {
+		for (size_t i = 0; i < NTHREADS - 1; i++) {
 			size_t size = stride + (i < extra);
 
 			tis[i] = {&old_grid, &new_grid, base, base + size, fixed, aligned};

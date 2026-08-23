@@ -273,7 +273,7 @@ Proxy &Proxy::operator=(double x) {
 }
 
 template <bool aligned>
-static void _apply_stencil_float(const Grid &old_grid, Grid &new_grid, size_t start, size_t end) {
+static void apply_stencil_float(const Grid &old_grid, Grid &new_grid, size_t start, size_t end) {
 	const size_t M = old_grid.cols();
 
 	const double *__restrict__ old_data = old_grid.get_float(0, 0);
@@ -339,7 +339,7 @@ static void _apply_stencil_float(const Grid &old_grid, Grid &new_grid, size_t st
 }
 
 template <bool aligned>
-static void _apply_stencil_fixed(const Grid &old_grid, Grid &new_grid, size_t start, size_t end, bool odd) {
+static void apply_stencil_fixed(const Grid &old_grid, Grid &new_grid, size_t start, size_t end, bool odd) {
 	const size_t M = old_grid.cols();
 
 	const uint32_t *__restrict__ old_data = old_grid.get_fixed(0, 0);
@@ -407,15 +407,28 @@ static void _apply_stencil_fixed(const Grid &old_grid, Grid &new_grid, size_t st
 	}
 }
 
-struct ThreadInfo {
-	union {
-		struct {
-			const Grid *old_grid;
-			Grid *new_grid;
-			size_t start, end;
-			bool fixed, aligned;
-		};
-		uint8_t pad[64];
+static void dispatch(
+	const Grid &old_grid, Grid &new_grid, size_t start, size_t end, bool odd, bool fixed, bool aligned
+) {
+	if (fixed) {
+		if (__builtin_expect(aligned, true))
+			apply_stencil_fixed<true>(old_grid, new_grid, start, end, odd);
+		else
+			apply_stencil_fixed<false>(old_grid, new_grid, start, end, odd);
+	} else {
+		if (__builtin_expect(aligned, true))
+			apply_stencil_float<true>(old_grid, new_grid, start, end);
+		else
+			apply_stencil_float<false>(old_grid, new_grid, start, end);
+	}
+}
+
+struct alignas(64) ThreadInfo {
+	struct {
+		const Grid *old_grid;
+		Grid *new_grid;
+		size_t start, end;
+		bool fixed, aligned;
 	};
 };
 
@@ -433,18 +446,7 @@ static void worker(int idx) {
 		while (epoch.load(std::memory_order_acquire) < cur_epoch)
 			_mm_pause();
 
-		if (t.fixed) {
-			if (__builtin_expect(t.aligned, true))
-				_apply_stencil_fixed<true>(*t.old_grid, *t.new_grid, t.start, t.end, t.old_grid->odd());
-			else
-				_apply_stencil_fixed<false>(*t.old_grid, *t.new_grid, t.start, t.end, t.old_grid->odd());
-
-		} else {
-			if (__builtin_expect(t.aligned, true))
-				_apply_stencil_float<true>(*t.old_grid, *t.new_grid, t.start, t.end);
-			else
-				_apply_stencil_float<false>(*t.old_grid, *t.new_grid, t.start, t.end);
-		}
+		dispatch(*t.old_grid, *t.new_grid, t.start, t.end, t.old_grid->odd(), t.fixed, t.aligned);
 
 		done.fetch_add(1, std::memory_order_release);
 	}
@@ -474,23 +476,9 @@ static void apply_stencil(const Grid &old_grid, Grid &new_grid) {
 		done.store(0, std::memory_order_relaxed);
 		epoch.fetch_add(1, std::memory_order_release);
 
-		if (fixed) {
-			if (__builtin_expect(aligned, true))
-				_apply_stencil_fixed<true>(old_grid, new_grid, base, N - 1, old_grid.odd());
-			else
-				_apply_stencil_fixed<false>(old_grid, new_grid, base, N - 1, old_grid.odd());
-		} else {
-			if (__builtin_expect(aligned, true))
-				_apply_stencil_float<true>(old_grid, new_grid, base, N - 1);
-			else
-				_apply_stencil_float<false>(old_grid, new_grid, base, N - 1);
-		}
+		dispatch(old_grid, new_grid, base, N - 1, old_grid.odd(), fixed, aligned);
 	} else {
-		if (fixed) {
-			_apply_stencil_fixed<false>(old_grid, new_grid, 1, N - 1, old_grid.odd());
-		} else {
-			_apply_stencil_float<false>(old_grid, new_grid, 1, N - 1);
-		}
+		dispatch(old_grid, new_grid, 1, N - 1, old_grid.odd(), fixed, aligned);
 	}
 
 	if (fixed) {

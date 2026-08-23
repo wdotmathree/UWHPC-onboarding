@@ -10,7 +10,6 @@
 #include <thread>
 
 #include <immintrin.h>
-#include <sys/mman.h>
 
 class Grid;
 
@@ -39,7 +38,6 @@ class Grid {
 private:
 	size_t rows_;
 	size_t cols_;
-	size_t size_;
 
 	// 32-byte alignment MUST be ensured due to the use of VMOVAPD and VMOVDQA in the kernels
 	// Elected to provide 64-byte alignment for caching purposes
@@ -65,40 +63,18 @@ private:
 
 public:
 	Grid(size_t rows, size_t cols) : rows_(rows), cols_(cols) {
-		constexpr size_t align = 0x200000; // THP page size
-		size_ = rows * cols * sizeof(double);
+		size_t float_size = rows * cols * sizeof(double);
 		size_t fixed_size = rows * cols * sizeof(uint32_t);
-		size_t align_fixed = (64 - size_ % 64) % 64;
-		size_ += align_fixed + fixed_size;
-		size_t req = size_ + align;
+		size_t align_fixed = (64 - float_size % 64) % 64;
+		size_t size = float_size + align_fixed + fixed_size;
 
-		void *raw = mmap(nullptr, req, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
-		if (raw == MAP_FAILED)
-			throw std::bad_alloc();
-
-		uintptr_t addr = (uintptr_t)raw;
-		uintptr_t aligned = (addr + align - 1) & ~(align - 1);
-		size_t front_slack = aligned - addr;
-		size_t back_slack = req - front_slack - size_;
-
-		if (front_slack)
-			munmap(raw, front_slack);
-		if (back_slack)
-			munmap((void *)(aligned + size_), back_slack);
-
-		raw = (void *)aligned;
-		data_ = (double *)aligned;
-		fixed_ = (uint32_t *)(aligned + rows * cols * sizeof(double) + align_fixed);
-
-		madvise(data_, size_, MADV_SEQUENTIAL);
-		madvise(data_, size_, MADV_UNMERGEABLE);
-		madvise(data_, size_, MADV_HUGEPAGE);
-		madvise(data_, size_, MADV_COLLAPSE);
-		memset(data_, 0, size_);
+		data_ = (double *)::operator new(size, std::align_val_t(64));
+		fixed_ = (uint32_t *)((uintptr_t)data_ + float_size + align_fixed);
+		memset(data_, 0, size);
 	}
 
 	~Grid() {
-		munmap(data_, size_);
+		::operator delete(data_, std::align_val_t(64));
 	}
 
 	Grid(const Grid &) = delete;

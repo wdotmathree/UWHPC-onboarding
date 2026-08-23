@@ -78,7 +78,10 @@ public:
 		raw = (void *)aligned;
 		data_ = (double *)aligned;
 		fixed_ = (uint32_t *)(aligned + rows * cols * sizeof(double) + align_fixed);
-		madvise(data_, size_, MADV_SEQUENTIAL | MADV_UNMERGEABLE | MADV_HUGEPAGE | MADV_COLLAPSE);
+		madvise(data_, size_, MADV_SEQUENTIAL);
+		madvise(data_, size_, MADV_UNMERGEABLE);
+		madvise(data_, size_, MADV_HUGEPAGE);
+		madvise(data_, size_, MADV_COLLAPSE);
 		memset(data_, 0, size_);
 	}
 

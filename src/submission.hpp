@@ -3,9 +3,12 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <emmintrin.h>
+#include <mutex>
 #include <new>
 #include <thread>
 
@@ -66,11 +69,11 @@ public:
 		size_t float_size = rows * cols * sizeof(double);
 		size_t fixed_size = rows * cols * sizeof(uint32_t);
 		size_t align_fixed = (64 - float_size % 64) % 64;
-		size_t size = float_size + align_fixed + fixed_size;
+		size_t alloc_size = float_size + align_fixed + fixed_size;
 
-		data_ = (double *)::operator new(size, std::align_val_t(64));
+		data_ = (double *)::operator new(alloc_size, std::align_val_t(64));
 		fixed_ = (uint32_t *)((uintptr_t)data_ + float_size + align_fixed);
-		memset(data_, 0, size);
+		memset(data_, 0, alloc_size);
 	}
 
 	~Grid() {
@@ -438,6 +441,7 @@ static void dispatch(
 
 struct alignas(64) ThreadInfo {
 	struct {
+		std::thread *thread;
 		const Grid *old_grid;
 		Grid *new_grid;
 		size_t start, end;
@@ -446,18 +450,42 @@ struct alignas(64) ThreadInfo {
 };
 
 static constexpr int NTHREADS = 4;
+static constexpr int MAX_SPIN = 500000;
+
+// The following 3 are purposefully leaked since we don't have a proper way of cancelling workers
+// and deleting a cv or mutex while workers are waiting is UB (caused hang on my machine)
 alignas(64) static ThreadInfo tis[NTHREADS - 1];
-alignas(64) static std::atomic_int done = 0;
-alignas(64) static std::atomic_int epoch = 0;
+static std::condition_variable *cv;
+static std::mutex *mu;
+
+static std::atomic_int done = 0;
+static std::atomic_int epoch = 0;
+static std::atomic_bool cancel = false;
+
+// Returns `true` if the program is shutting down
+static bool spin_then_sleep(int cur_epoch) {
+	for (int spin = 0; spin < MAX_SPIN; spin++) {
+		if (cancel.load(std::memory_order_acquire))
+			return true;
+		if (epoch.load(std::memory_order_acquire) >= cur_epoch)
+			return false;
+		_mm_pause();
+	}
+
+	std::unique_lock lk{*mu};
+	cv->wait(lk, [&] {
+		return cancel.load(std::memory_order_acquire) || epoch.load(std::memory_order_acquire) >= cur_epoch;
+	});
+	return cancel.load(std::memory_order_acquire);
+}
 
 static void worker(int idx) {
 	const ThreadInfo &t = tis[idx];
 	int cur_epoch = 0;
 
 	while (true) {
-		cur_epoch++;
-		while (epoch.load(std::memory_order_acquire) < cur_epoch)
-			_mm_pause();
+		if (spin_then_sleep(++cur_epoch))
+			return;
 
 		dispatch(*t.old_grid, *t.new_grid, t.start, t.end, t.old_grid->odd(), t.fixed, t.aligned);
 
@@ -482,12 +510,16 @@ static void apply_stencil(const Grid &old_grid, Grid &new_grid) {
 		for (size_t i = 0; i < NTHREADS - 1; i++) {
 			size_t size = stride + (i < extra);
 
-			tis[i] = {&old_grid, &new_grid, base, base + size, fixed, aligned};
+			tis[i] = {tis[i].thread, &old_grid, &new_grid, base, base + size, fixed, aligned};
 			base += size;
 		}
 
 		done.store(0, std::memory_order_relaxed);
-		epoch.fetch_add(1, std::memory_order_release);
+		{
+			std::lock_guard lock(*mu);
+			epoch.fetch_add(1, std::memory_order_release);
+		}
+		cv->notify_all();
 
 		dispatch(old_grid, new_grid, base, N - 1, old_grid.odd(), fixed, aligned);
 	} else {
@@ -509,8 +541,23 @@ static void apply_stencil(const Grid &old_grid, Grid &new_grid) {
 	}
 }
 
-__attribute__((constructor)) static void init_workers() {
+__attribute__((constructor(65535))) static void init_workers() {
+	cv = new std::condition_variable;
+	mu = new std::mutex;
+
 	for (int i = 0; i < NTHREADS - 1; i++) {
-		std::thread(worker, i).detach();
+		tis[i].thread = new std::thread(worker, i);
+	}
+}
+
+__attribute__((destructor(65535))) static void dtor_workers() {
+	{
+		std::lock_guard lock(*mu);
+		cancel.store(true, std::memory_order_release);
+	}
+	cv->notify_all();
+
+	for (int i = 0; i < NTHREADS - 1; i++) {
+		tis[i].thread->join();
 	}
 }

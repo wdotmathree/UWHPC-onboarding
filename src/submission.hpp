@@ -48,6 +48,7 @@ private:
 	mutable double quant_;
 	mutable double dequant_;
 	mutable bool bad_ = false;
+	mutable bool fixed_valid_ = false;
 
 	friend class Proxy;
 
@@ -93,7 +94,7 @@ public:
 	}
 	double operator()(size_t i, size_t j) const {
 		size_t idx = i * cols_ + j;
-		if (bad_ || max_steps_ == 0)
+		if (!fixed_valid_)
 			return data_[idx];
 
 		return fixed_[idx] * dequant_ + min_;
@@ -123,9 +124,8 @@ public:
 	}
 
 	void fallback() const {
-		if (max_steps_ == 0) {
+		if (!fixed_valid_)
 			return;
-		}
 
 		const size_t stride = 256 / 8 / sizeof(double);
 		const size_t S = rows_ * cols_;
@@ -144,6 +144,8 @@ public:
 		for (size_t i = S - T; i < S; i++) {
 			data_[i] = double(fixed_[i]) * dequant_ + min_;
 		}
+
+		fixed_valid_ = false;
 	}
 
 	void promote() const {
@@ -151,13 +153,18 @@ public:
 		const size_t S = rows_ * cols_;
 		const size_t T = S % stride;
 
-		// We can use standard max/min here since weird numbers are already checked
+		__m256d nan = _mm256_setzero_pd();
 		__m256d max = _mm256_set1_pd(-INFINITY);
 		__m256d min = _mm256_set1_pd(+INFINITY);
 		for (int i = 0; i < S - T; i += stride) {
 			__m256d val = _mm256_load_pd(data_ + i);
+			nan = _mm256_or_pd(nan, _mm256_cmp_pd(val, val, _CMP_UNORD_Q));
 			max = _mm256_max_pd(max, val);
 			min = _mm256_min_pd(min, val);
+		}
+		if (__builtin_expect(_mm256_movemask_pd(nan) != 0, false)) {
+			bad_ = true;
+			return;
 		}
 		__m128d lo = _mm256_castpd256_pd128(max);
 		__m128d hi = _mm256_extractf128_pd(max, 1);
@@ -170,6 +177,10 @@ public:
 		hi = _mm_unpackhi_pd(lo, lo);
 		min_ = _mm_cvtsd_f64(_mm_min_sd(lo, hi));
 		for (int i = S - T; i < S; i++) {
+			if (__builtin_expect(std::isnan(data_[i]), false)) {
+				bad_ = true;
+				return;
+			}
 			max_ = std::max(max_, data_[i]);
 			min_ = std::min(min_, data_[i]);
 		}
@@ -203,6 +214,8 @@ public:
 		for (size_t i = S - T; i < S; i++) {
 			fixed_[i] = std::nearbyint((data_[i] - min_) * quant_);
 		}
+
+		fixed_valid_ = true;
 	}
 
 	// Returns true if the fixed point representation is valid
@@ -234,37 +247,26 @@ public:
 		quant_ = o.quant_;
 		dequant_ = o.dequant_;
 		bad_ = o.bad_;
+		fixed_valid_ = o.fixed_valid_;
 	}
 };
 
 Proxy::operator double() const {
-	if (g->bad_ || g->max_steps_ == 0)
+	if (!g->fixed_valid_)
 		return g->data_[idx];
 
 	return g->fixed_[idx] * g->dequant_ + g->min_;
 }
 
 Proxy Proxy::operator=(double x) {
-	// Fallback to floats only if we get something weird
-	if (g->bad_ || !std::isfinite(x)) {
-		g->bad_ = true;
-		g->max_steps_ = 0;
-		g->data_[idx] = x;
-		return *this;
-	}
-
-	if (g->num_steps_ != 0 && g->max_steps_ != 0) {
+	if (g->bad_ || g->num_steps_ != 0) {
 		g->fallback();
-		g->bad_ = true;
-		g->data_[idx] = x;
-		g->max_steps_ = 0;
+		g->bad_ = false;
 		g->num_steps_ = 0;
-		return *this;
 	}
 
 	g->data_[idx] = x;
 	g->max_steps_ = 0;
-	g->num_steps_ = 0;
 
 	return *this;
 }

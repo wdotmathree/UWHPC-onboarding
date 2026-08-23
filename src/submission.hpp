@@ -118,6 +118,9 @@ public:
 	size_t cols() const {
 		return cols_;
 	}
+	bool odd() const {
+		return num_steps_ % 2;
+	}
 
 	void fallback() const {
 		if (max_steps_ == 0) {
@@ -159,6 +162,10 @@ public:
 
 		const double ERR_GROWTH_RATE = 4e11; // Empirically found constant
 		max_steps_ = std::fmin(std::floor(quant_ * quant_ / ERR_GROWTH_RATE), 1e18);
+		if (max_steps_ == 0) {
+			bad_ = true;
+			return;
+		}
 
 		const __m256d quant = _mm256_set1_pd(quant_);
 		const __m256d offset = _mm256_set1_pd(min_);
@@ -241,7 +248,8 @@ Proxy Proxy::operator=(double x) {
 	return *this;
 }
 
-template <bool aligned> static void _apply_stencil(const Grid &old_grid, Grid &new_grid, size_t start, size_t end) {
+template <bool aligned>
+static void _apply_stencil_float(const Grid &old_grid, Grid &new_grid, size_t start, size_t end) {
 	const size_t N = old_grid.rows();
 	const size_t M = old_grid.cols();
 
@@ -307,8 +315,83 @@ template <bool aligned> static void _apply_stencil(const Grid &old_grid, Grid &n
 	}
 
 	if (start < end) {
-		new_data[start * M] = old_data[start * M];
 		new_data[(end - 1) * M + M - 1] = old_data[(end - 1) * M + M - 1];
+		new_data[start * M] = old_data[start * M];
+	}
+}
+
+template <bool aligned>
+static void _apply_stencil_fixed(const Grid &old_grid, Grid &new_grid, size_t start, size_t end, bool odd) {
+	const size_t N = old_grid.rows();
+	const size_t M = old_grid.cols();
+
+	const uint32_t *__restrict__ old_data = old_grid.get_fixed(0, 0);
+	uint32_t *__restrict__ new_data = new_grid.get_fixed(0, 0);
+
+	if constexpr (!aligned) {
+		if (M <= 2) {
+			if (start < end)
+				memcpy(new_data + start * M, old_data + start * M, (end - start) * M * sizeof(uint32_t));
+			return;
+		}
+	}
+
+	const size_t stride = 256 / 8 / sizeof(uint32_t);
+
+	uint32_t _inner_round = odd ? 0 : 1;
+	uint32_t _outer_round = odd ? 3 : 4;
+	const __m256i inner_round = _mm256_set1_epi32(_inner_round);
+	const __m256i outer_round = _mm256_set1_epi32(_outer_round);
+
+	for (int i = start; i < end; i++) {
+		const uint32_t *row = old_data + (size_t)i * M;
+		uint32_t *nrow = new_data + (size_t)i * M;
+
+		if constexpr (aligned) {
+			for (int j = 0; j < M; j += stride) {
+				__m256i up = _mm256_load_si256((__m256i *)(row + j - M));
+				__m256i down = _mm256_load_si256((__m256i *)(row + j + M));
+				__m256i left = _mm256_loadu_si256((__m256i *)(row + j - 1));
+				__m256i right = _mm256_loadu_si256((__m256i *)(row + j + 1));
+				__m256i cur = _mm256_load_si256((__m256i *)(row + j));
+
+				__m256i outer = _mm256_add_epi32(_mm256_add_epi32(up, down), _mm256_add_epi32(left, right));
+
+				__m256i around = _mm256_srli_epi32(_mm256_add_epi32(outer, outer_round), 3);
+				__m256i inner = _mm256_srli_epi32(_mm256_add_epi32(cur, inner_round), 1);
+
+				cur = _mm256_add_epi32(inner, around);
+				_mm256_store_si256((__m256i *)(nrow + j), cur);
+			}
+		} else {
+			const size_t T = (M - 1) % stride;
+			for (int j = 1; j < M - T; j += stride) {
+				__m256i up = _mm256_loadu_si256((__m256i *)(row + j - M));
+				__m256i down = _mm256_loadu_si256((__m256i *)(row + j + M));
+				__m256i left = _mm256_loadu_si256((__m256i *)(row + j - 1));
+				__m256i right = _mm256_loadu_si256((__m256i *)(row + j + 1));
+				__m256i cur = _mm256_loadu_si256((__m256i *)(row + j));
+
+				__m256i outer = _mm256_add_epi32(_mm256_add_epi32(up, down), _mm256_add_epi32(left, right));
+
+				__m256i around = _mm256_srli_epi32(_mm256_add_epi32(outer, outer_round), 3);
+				__m256i inner = _mm256_srli_epi32(_mm256_add_epi32(cur, inner_round), 1);
+
+				cur = _mm256_add_epi32(inner, around);
+				_mm256_storeu_si256((__m256i *)(nrow + j), cur);
+			}
+			for (int j = M - T; j < M; j++)
+				nrow[j] = ((row[j] + _inner_round) >> 1) +
+						  ((row[j - M] + row[j - 1] + row[j + M] + row[j + 1] + _outer_round) >> 3);
+		}
+
+		nrow[M - 1] = row[M - 1];
+		nrow[0] = row[0];
+	}
+
+	if (start < end) {
+		new_data[(end - 1) * M + M - 1] = old_data[(end - 1) * M + M - 1];
+		new_data[start * M] = old_data[start * M];
 	}
 }
 
@@ -338,10 +421,18 @@ static void worker(int idx) {
 		while (epoch.load(std::memory_order_acquire) < cur_epoch)
 			_mm_pause();
 
-		if (__builtin_expect(t.aligned, true))
-			_apply_stencil<true>(*t.old_grid, *t.new_grid, t.start, t.end);
-		else
-			_apply_stencil<false>(*t.old_grid, *t.new_grid, t.start, t.end);
+		if (t.fixed) {
+			if (__builtin_expect(t.aligned, true))
+				_apply_stencil_fixed<true>(*t.old_grid, *t.new_grid, t.start, t.end, t.old_grid->odd());
+			else
+				_apply_stencil_fixed<false>(*t.old_grid, *t.new_grid, t.start, t.end, t.old_grid->odd());
+
+		} else {
+			if (__builtin_expect(t.aligned, true))
+				_apply_stencil_float<true>(*t.old_grid, *t.new_grid, t.start, t.end);
+			else
+				_apply_stencil_float<false>(*t.old_grid, *t.new_grid, t.start, t.end);
+		}
 
 		done.fetch_add(1, std::memory_order_release);
 	}
@@ -371,17 +462,28 @@ static void apply_stencil(const Grid &old_grid, Grid &new_grid) {
 		done.store(0, std::memory_order_relaxed);
 		epoch.fetch_add(1, std::memory_order_release);
 
-		if (__builtin_expect(aligned, true))
-			_apply_stencil<true>(old_grid, new_grid, base, N - 1);
-		else
-			_apply_stencil<false>(old_grid, new_grid, base, N - 1);
+		if (fixed) {
+			if (__builtin_expect(aligned, true))
+				_apply_stencil_fixed<true>(old_grid, new_grid, base, N - 1, old_grid.odd());
+			else
+				_apply_stencil_fixed<false>(old_grid, new_grid, base, N - 1, old_grid.odd());
+		} else {
+			if (__builtin_expect(aligned, true))
+				_apply_stencil_float<true>(old_grid, new_grid, base, N - 1);
+			else
+				_apply_stencil_float<false>(old_grid, new_grid, base, N - 1);
+		}
 	} else {
-		_apply_stencil<false>(old_grid, new_grid, 1, N - 1);
+		if (fixed) {
+			_apply_stencil_fixed<false>(old_grid, new_grid, 1, N - 1, old_grid.odd());
+		} else {
+			_apply_stencil_float<false>(old_grid, new_grid, 1, N - 1);
+		}
 	}
 
 	if (fixed) {
-		std::memcpy(new_grid.get_fixed(N - 1, 0), old_grid.get_fixed(N - 1, 0), M * sizeof(double));
-		std::memcpy(new_grid.get_fixed(0, 0), old_grid.get_fixed(0, 0), M * sizeof(double));
+		std::memcpy(new_grid.get_fixed(N - 1, 0), old_grid.get_fixed(N - 1, 0), M * sizeof(uint32_t));
+		std::memcpy(new_grid.get_fixed(0, 0), old_grid.get_fixed(0, 0), M * sizeof(uint32_t));
 	} else {
 		std::memcpy(new_grid.get_float(N - 1, 0), old_grid.get_float(N - 1, 0), M * sizeof(double));
 		std::memcpy(new_grid.get_float(0, 0), old_grid.get_float(0, 0), M * sizeof(double));

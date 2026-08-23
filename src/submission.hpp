@@ -14,6 +14,7 @@
 
 class Grid;
 
+// Pretends to be a `double`
 class Proxy {
 private:
 	Grid *g;
@@ -40,15 +41,25 @@ private:
 	size_t cols_;
 	size_t size_;
 
+	// 32-byte alignment MUST be ensured due to the use of VMOVAPD and VMOVDQA in the kernels
+	// Elected to provide 64-byte alignment for caching purposes
 	double *data_;
+	// Technically not true fixed point anymore (Q isn't necessarily a power of 2)
+	// Just generic quantization since conversion speed is not a factor, so we can squeeze out more
+	// precision with arbitrary quantization factors
 	uint32_t *fixed_;
 
+	// Step budget until we must switch back to doubles to avoid error accumulation
 	mutable size_t max_steps_ = 0;
 	mutable size_t num_steps_ = 0;
+
+	// The current data cannot be quantized
+	mutable bool bad_ = false;
+	// If true, the quantized buffer `fixed_` is up to date (`data_` MAY be outdated)
+	mutable bool fixed_valid_ = false;
+
 	mutable double min_ = +INFINITY;
 	mutable double dequant_;
-	mutable bool bad_ = false;
-	mutable bool fixed_valid_ = false;
 
 	friend class Proxy;
 
@@ -57,7 +68,7 @@ public:
 		constexpr size_t align = 0x200000; // THP page size
 		size_ = rows * cols * sizeof(double);
 		size_t fixed_size = rows * cols * sizeof(uint32_t);
-		size_t align_fixed = (32 - size_ % 32) % 32;
+		size_t align_fixed = (64 - size_ % 64) % 64;
 		size_ += align_fixed + fixed_size;
 		size_t req = size_ + align;
 
@@ -78,6 +89,7 @@ public:
 		raw = (void *)aligned;
 		data_ = (double *)aligned;
 		fixed_ = (uint32_t *)(aligned + rows * cols * sizeof(double) + align_fixed);
+
 		madvise(data_, size_, MADV_SEQUENTIAL);
 		madvise(data_, size_, MADV_UNMERGEABLE);
 		madvise(data_, size_, MADV_HUGEPAGE);
@@ -126,6 +138,7 @@ public:
 		return num_steps_ % 2;
 	}
 
+	// Go to `double` mode and make `data_` the authoritative buffer
 	void fallback() const {
 		if (!fixed_valid_)
 			return;
@@ -140,6 +153,7 @@ public:
 		// Alignment guaranteed from alloc
 		for (size_t i = 0; i < S - T; i += stride) {
 			__m128i orig = _mm_load_si128((__m128i *)(fixed_ + i));
+			// Signed conversion is fine since we quantized max to 0xfffffff8 / 4 (fits in int32)
 			__m256d cvt = _mm256_cvtepi32_pd(orig);
 			__m256d final = _mm256_fmadd_pd(cvt, dequant, offset);
 			_mm256_store_pd(data_ + i, final);
@@ -151,6 +165,7 @@ public:
 		fixed_valid_ = false;
 	}
 
+	// Go to quantized mode and make `fixed_` the authoritative buffer
 	void promote() const {
 		const size_t stride = 256 / 8 / sizeof(double);
 		const size_t S = rows_ * cols_;
@@ -194,6 +209,9 @@ public:
 			return;
 		}
 
+		// The 4 tiles around must sum to <= 0xfffffff8 to leave room for the rounding factor
+		// Why not 0xfffffffb? We limit the individual components to 0x3ffffffe so they sum to 0xfffffff8
+		// If we limited them to 0x3fffffff instead, they sum to 0xfffffffc which is too big
 		double quant_ = std::floor((double(0xfffffff8U) / 4) / range);
 		dequant_ = 1.0 / quant_;
 
@@ -211,6 +229,7 @@ public:
 		for (size_t i = 0; i < S - T; i += stride) {
 			__m256d orig = _mm256_load_pd(data_ + i);
 			__m256d scaled = _mm256_mul_pd(quant, _mm256_sub_pd(orig, offset));
+			// Signed conversion is fine since we quantized max to 0xfffffff8 / 4 (fits in int32)
 			__m128i cvt = _mm256_cvtpd_epi32(scaled);
 			_mm_store_si128((__m128i *)(fixed_ + i), cvt);
 		}
@@ -297,6 +316,9 @@ static void apply_stencil_float(const Grid &old_grid, Grid &new_grid, size_t sta
 		double *nrow = new_data + (size_t)i * M;
 
 		if constexpr (aligned) {
+			// Left and right can read out of bounds on the first/last iteration
+			// This is fine because we own the memory there, it's just one row up/down
+			// It only clobbers elements on the two edges, which we overwrite after
 			for (size_t j = 0; j < M; j += stride) {
 				__m256d up = _mm256_load_pd(row + j - M);
 				__m256d down = _mm256_load_pd(row + j + M);
@@ -313,6 +335,8 @@ static void apply_stencil_float(const Grid &old_grid, Grid &new_grid, size_t sta
 				_mm256_store_pd(nrow + j, cur);
 			}
 		} else {
+			// I'm not sure if the differing loop bounds is actually necessary? I think we can actually just
+			// do the exact same computation as above but using loadu and storeu everywhere.
 			const size_t T = (M - 1) % stride;
 			for (size_t j = 1; j < M - T; j += stride) {
 				__m256d up = _mm256_loadu_pd(row + j - M);
@@ -329,10 +353,11 @@ static void apply_stencil_float(const Grid &old_grid, Grid &new_grid, size_t sta
 
 				_mm256_storeu_pd(nrow + j, cur);
 			}
-			for (size_t j = M - T; j < M; j++)
+			for (size_t j = M - T; j < M - 1; j++)
 				nrow[j] = 0.5 * row[j] + 0.125 * (row[j - M] + row[j - 1] + row[j + M] + row[j + 1]);
 		}
 
+		// Fix the clobbered edges
 		nrow[M - 1] = row[M - 1];
 		nrow[0] = row[0];
 	}
@@ -355,6 +380,12 @@ static void apply_stencil_fixed(const Grid &old_grid, Grid &new_grid, size_t sta
 
 	const size_t stride = 256 / 8 / sizeof(uint32_t);
 
+	// Bias cancellation: since round to even is too expensive and rounding halves up would incur tons
+	// of extra error that we can't afford, we employ bias cancellation by alternating halves up/down
+	// for each iteration.
+	// Due to the ordering of function calls in `apply_stencil`, odd actually indicates whether the
+	// **next** iteration is odd, so it's actually negated from the correct value. However, we don't care
+	// about its actual value, we just need it to alternate between iterations.
 	uint32_t _inner_round = odd ? 0 : 1;
 	uint32_t _outer_round = odd ? 3 : 4;
 	const __m256i inner_round = _mm256_set1_epi32(_inner_round);
@@ -365,6 +396,9 @@ static void apply_stencil_fixed(const Grid &old_grid, Grid &new_grid, size_t sta
 		uint32_t *nrow = new_data + (size_t)i * M;
 
 		if constexpr (aligned) {
+			// Left and right can read out of bounds on the first/last iteration
+			// This is fine because we own the memory there, it's just one row up/down
+			// It only clobbers elements on the two edges, which we overwrite after
 			for (size_t j = 0; j < M; j += stride) {
 				__m256i up = _mm256_load_si256((__m256i *)(row + j - M));
 				__m256i down = _mm256_load_si256((__m256i *)(row + j + M));
@@ -381,6 +415,8 @@ static void apply_stencil_fixed(const Grid &old_grid, Grid &new_grid, size_t sta
 				_mm256_store_si256((__m256i *)(nrow + j), cur);
 			}
 		} else {
+			// I'm not sure if the differing loop bounds is actually necessary? I think we can actually just
+			// do the exact same computation as above but using loadu and storeu everywhere.
 			const size_t T = (M - 1) % stride;
 			for (size_t j = 1; j < M - T; j += stride) {
 				__m256i up = _mm256_loadu_si256((__m256i *)(row + j - M));
@@ -397,11 +433,12 @@ static void apply_stencil_fixed(const Grid &old_grid, Grid &new_grid, size_t sta
 				cur = _mm256_add_epi32(inner, around);
 				_mm256_storeu_si256((__m256i *)(nrow + j), cur);
 			}
-			for (size_t j = M - T; j < M; j++)
+			for (size_t j = M - T; j < M - 1; j++)
 				nrow[j] = ((row[j] + _inner_round) >> 1) +
 						  ((row[j - M] + row[j - 1] + row[j + M] + row[j + 1] + _outer_round) >> 3);
 		}
 
+		// Fix the clobbered edges
 		nrow[M - 1] = row[M - 1];
 		nrow[0] = row[0];
 	}

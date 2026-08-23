@@ -151,6 +151,29 @@ public:
 		const size_t S = rows_ * cols_;
 		const size_t T = S % stride;
 
+		// We can use standard max/min here since weird numbers are already checked
+		__m256d max = _mm256_set1_pd(-INFINITY);
+		__m256d min = _mm256_set1_pd(+INFINITY);
+		for (int i = 0; i < S - T; i += stride) {
+			__m256d val = _mm256_load_pd(data_ + i);
+			max = _mm256_max_pd(max, val);
+			min = _mm256_min_pd(min, val);
+		}
+		__m128d lo = _mm256_castpd256_pd128(max);
+		__m128d hi = _mm256_extractf128_pd(max, 1);
+		lo = _mm_max_pd(lo, hi);
+		hi = _mm_unpackhi_pd(lo, lo);
+		max_ = _mm_cvtsd_f64(_mm_max_sd(lo, hi));
+		lo = _mm256_castpd256_pd128(min);
+		hi = _mm256_extractf128_pd(min, 1);
+		lo = _mm_min_pd(lo, hi);
+		hi = _mm_unpackhi_pd(lo, lo);
+		min_ = _mm_cvtsd_f64(_mm_min_sd(lo, hi));
+		for (int i = S - T; i < S; i++) {
+			max_ = std::max(max_, data_[i]);
+			min_ = std::min(min_, data_[i]);
+		}
+
 		double range = max_ - min_;
 		if (std::fpclassify(range) != FP_NORMAL) {
 			bad_ = true;
@@ -239,8 +262,6 @@ Proxy Proxy::operator=(double x) {
 		return *this;
 	}
 
-	g->min_ = std::min(g->min_, x);
-	g->max_ = std::max(g->max_, x);
 	g->data_[idx] = x;
 	g->max_steps_ = 0;
 	g->num_steps_ = 0;
